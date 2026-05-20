@@ -247,6 +247,12 @@ If you edited `vercel.json` and removed that line, add it back.
 
 After fixing either of these, trigger a new deployment from the Vercel dashboard.
 
+### "Function Runtimes must have a valid version"
+Vercel expects community runtimes in `name@version` format (e.g. `now-php@1.0.0`).
+For Python, **no `runtime` field is needed** — Vercel auto-detects it from the `.py` extension.
+The `vercel.json` in this repo only specifies `maxDuration` and `memory` for the function, not a runtime.
+If you see this error you may have accidentally added a `runtime` key — remove it.
+
 ### "No FastAPI entrypoint found"
 Ensure `pyproject.toml` exists at the project root with:
 ```toml
