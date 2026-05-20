@@ -11,6 +11,7 @@ The sample document is a multi-page scanned fax (Boston Orthotics & Prosthetics)
 Patient data appears on page 1 ("Patient Name and Address" / "Patient Date of Birth")
 and page 2 ("Patient Name:" / "DOB:" in a Clinical Summary header).
 """
+from __future__ import annotations
 
 import base64
 import io
@@ -19,7 +20,7 @@ import re
 import uuid
 import logging
 from datetime import date, datetime
-from typing import List
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -285,7 +286,7 @@ async def upload_document(
         logger.warning("pdfplumber failed: %s", exc)
 
     has_text_layer = bool(pdf_text)
-    patient_info: ExtractedPatientInfo | None = None
+    patient_info: Optional[ExtractedPatientInfo] = None
 
     if has_text_layer:
         logger.info("PDF has text layer (%d chars). Using text extraction.", len(pdf_text))

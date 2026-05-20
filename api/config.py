@@ -4,7 +4,11 @@ from typing import List
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",  # ignore NEXT_PUBLIC_* and other frontend-only vars
+    )
 
     # Database — default to SQLite for local dev, set PostgreSQL URL for production
     DATABASE_URL: str = "sqlite+aiosqlite:///./orders.db"
