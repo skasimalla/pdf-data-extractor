@@ -2,14 +2,14 @@
 PDF upload endpoint — extracts patient First Name, Last Name, and Date of Birth.
 
 Extraction pipeline (in priority order):
-  1. pdfplumber text layer  → OpenAI GPT-4o-mini text extraction
-  2. pdfplumber text layer  → regex heuristics (no OpenAI key needed)
-  3. pypdfium2 image render → OpenAI GPT-4o-mini Vision  (scanned / fax PDFs)
-  4. No-key fallback        → returns a clear error asking for OPENAI_API_KEY
+  1. pdfplumber text layer  → regex heuristics  (fast, no API key)
+  2. pdfplumber text layer  → OpenAI GPT-4o-mini (optional, better accuracy)
+  3. pypdfium2 image render → rapidocr-onnxruntime OCR → regex  (scanned/fax, no API key)
+  4. pypdfium2 image render → OpenAI GPT-4o-mini Vision            (optional, best accuracy)
 
-The sample document is a multi-page scanned fax (Boston Orthotics & Prosthetics).
-Patient data appears on page 1 ("Patient Name and Address" / "Patient Date of Birth")
-and page 2 ("Patient Name:" / "DOB:" in a Clinical Summary header).
+Steps 2 and 4 only run when OPENAI_API_KEY is set.
+Steps 3 and 4 handle scanned/fax PDFs that have no text layer.
+rapidocr-onnxruntime uses bundled ONNX models — no internet access required at runtime.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import re
 import uuid
 import logging
 from datetime import date, datetime
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -36,37 +36,99 @@ router = APIRouter(prefix="/v1/upload", tags=["Upload"])
 
 MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 # Only render the first N pages — patient demographics always appear early
-MAX_VISION_PAGES = 2
+MAX_PAGES = 2
+
+# ─── Lazy OCR engine singleton ────────────────────────────────────────────────
+
+_ocr_engine: Optional[Any] = None
+_ocr_available: Optional[bool] = None
 
 
-# ─── Image rendering ─────────────────────────────────────────────────────────
+def _get_ocr_engine() -> Optional[Any]:
+    """Lazily initialise a RapidOCR engine (loads ONNX models once per process)."""
+    global _ocr_engine, _ocr_available
+    if _ocr_available is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR  # type: ignore
+            _ocr_engine = RapidOCR()
+            _ocr_available = True
+            logger.info("RapidOCR (ONNX) engine ready")
+        except Exception as exc:
+            logger.warning("RapidOCR not available — OCR disabled: %s", exc)
+            _ocr_available = False
+    return _ocr_engine if _ocr_available else None
 
 
-def _render_pdf_pages(pdf_bytes: bytes, max_pages: int = MAX_VISION_PAGES) -> List[str]:
-    """
-    Render the first `max_pages` pages of a PDF to base64-encoded JPEG strings
-    using pypdfium2 (no Poppler dependency).
+# ─── PDF rendering helpers ────────────────────────────────────────────────────
 
-    Returns a list of base64 strings, one per page.
-    """
+
+def _render_pages_pil(pdf_bytes: bytes, max_pages: int = MAX_PAGES) -> list:
+    """Render first `max_pages` pages of a PDF to PIL Images (2× scale for OCR quality)."""
     try:
         import pypdfium2 as pdfium  # type: ignore
     except ImportError:
         raise RuntimeError(
             "pypdfium2 is not installed. Add it to requirements.txt and redeploy."
         )
-
     doc = pdfium.PdfDocument(pdf_bytes)
-    pages_b64: List[str] = []
-
+    images = []
     for i in range(min(max_pages, len(doc))):
-        bitmap = doc[i].render(scale=2.0)  # 2× gives ~1224×1584 px — enough for Vision
-        pil_img = bitmap.to_pil()
-        buf = io.BytesIO()
-        pil_img.convert("RGB").save(buf, format="JPEG", quality=88)
-        pages_b64.append(base64.b64encode(buf.getvalue()).decode())
+        bitmap = doc[i].render(scale=2.0)
+        images.append(bitmap.to_pil().convert("RGB"))
+    return images
 
+
+def _render_pages_b64(pdf_bytes: bytes, max_pages: int = MAX_PAGES) -> List[str]:
+    """Render pages to base64-encoded JPEG strings (used for OpenAI Vision)."""
+    pages_b64: List[str] = []
+    for img in _render_pages_pil(pdf_bytes, max_pages):
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=88)
+        pages_b64.append(base64.b64encode(buf.getvalue()).decode())
     return pages_b64
+
+
+# ─── OCR extraction ───────────────────────────────────────────────────────────
+
+
+def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
+    """
+    Render a scanned PDF and run RapidOCR (ONNX) on each page.
+    Returns the concatenated raw text, or '' if OCR is unavailable.
+    No API key or system binary required.
+    """
+    ocr = _get_ocr_engine()
+    if not ocr:
+        return ""
+
+    try:
+        import numpy as np  # type: ignore
+    except ImportError:
+        logger.warning("numpy not available — OCR disabled")
+        return ""
+
+    try:
+        page_images = _render_pages_pil(pdf_bytes)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        logger.error("PDF rendering failed: %s", exc)
+        return ""
+
+    texts: List[str] = []
+    for img in page_images:
+        try:
+            arr = np.array(img)
+            result, _ = ocr(arr)
+            if result:
+                page_text = "\n".join(item[1] for item in result if item[1])
+                texts.append(page_text)
+        except Exception as exc:
+            logger.warning("OCR failed on page: %s", exc)
+
+    combined = "\n\n".join(texts)
+    logger.info("OCR produced %d characters from %d page(s)", len(combined), len(page_images))
+    return combined
 
 
 # ─── OpenAI Vision extraction (scanned / image-only PDFs) ────────────────────
@@ -74,7 +136,7 @@ def _render_pdf_pages(pdf_bytes: bytes, max_pages: int = MAX_VISION_PAGES) -> Li
 
 async def _extract_with_vision(pages_b64: List[str], api_key: str) -> ExtractedPatientInfo:
     """Send rendered page images to GPT-4o-mini Vision and return structured patient info."""
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI  # type: ignore
 
     client = AsyncOpenAI(api_key=api_key)
 
@@ -130,7 +192,7 @@ async def _extract_with_vision(pages_b64: List[str], api_key: str) -> ExtractedP
 
 async def _extract_with_openai_text(text: str, api_key: str) -> ExtractedPatientInfo:
     """Use GPT-4o-mini to extract patient info from already-extracted PDF text."""
-    from openai import AsyncOpenAI
+    from openai import AsyncOpenAI  # type: ignore
 
     client = AsyncOpenAI(api_key=api_key)
     response = await client.chat.completions.create(
@@ -160,59 +222,115 @@ async def _extract_with_openai_text(text: str, api_key: str) -> ExtractedPatient
     )
 
 
-# ─── Regex fallback (text layer only) ────────────────────────────────────────
+# ─── Regex extraction (works on both native text and OCR output) ──────────────
 
 
 def _extract_with_regex(text: str) -> ExtractedPatientInfo:
     """
-    Best-effort regex extraction for PDFs that have a text layer but no OpenAI key.
-    Covers common DME / prescription fax layouts.
+    Best-effort regex extraction for text-layer or OCR'd content.
+    Handles common DME / CPAP / prescription fax layouts, including
+    'Last, First', 'First Last', and labelled-field ('First Name: ...') forms.
+
+    OCR output is noisier than native text, so patterns are intentionally
+    permissive (allow extra whitespace / punctuation between label and value).
     """
     first = last = dob_str = ""
 
-    # "Last, First" layout
+    # Normalise runs of whitespace while preserving line structure
+    lines = [re.sub(r"[ \t]+", " ", line).strip() for line in text.splitlines()]
+    flat = "\n".join(lines)
+
+    # ── Name extraction ──────────────────────────────────────────────────────
+    #
+    # Priority order:
+    #   A) Inline same-line label  "Patient Name: First Last"  (page 2 of CPAP fax)
+    #   B) Inline with comma       "Patient Name: Last, First"
+    #   C) Next-line layout        "Patient Name and Address\n<junk>\nFirst Last\n"
+    #      (page 1 of CPAP fax — OCR merges column headers into prev line)
+    #   D) Explicit separate labels "First Name: X" / "Last Name: Y"
+
+    # A) Inline "Patient Name: First Last" — separator is only horizontal space, NOT newlines
     m = re.search(
-        r"(?:patient[\s_]*name(?:\s+and\s+address)?|name)\s*[:\-]?\s*"
-        r"([A-Za-z\-']+)\s*,\s*([A-Za-z\-']+)",
-        text, re.IGNORECASE,
+        r"patient[\s_]*name\s*[:\-][ \t]*([A-Za-z][A-Za-z\-'\.]+)[ \t]+([A-Za-z][A-Za-z\-'\.]+)",
+        flat, re.IGNORECASE,
     )
     if m:
-        last, first = m.group(1).strip(), m.group(2).strip()
-    else:
-        # "First Last" layout
+        first, last = m.group(1).strip(), m.group(2).strip()
+
+    # B) Inline "Last, First"
+    if not first and not last:
         m = re.search(
-            r"(?:patient[\s_]*name(?:\s+and\s+address)?|name)\s*[:\-]?\s*"
-            r"([A-Za-z\-']+)\s+([A-Za-z\-']+)",
-            text, re.IGNORECASE,
+            r"patient[\s_]*name\s*[:\-][ \t]*([A-Za-z][A-Za-z\-'\.]+)\s*,\s*([A-Za-z][A-Za-z\-'\.]+)",
+            flat, re.IGNORECASE,
         )
         if m:
-            first, last = m.group(1).strip(), m.group(2).strip()
+            last, first = m.group(1).strip(), m.group(2).strip()
 
+    # C) Next-line layout — scan up to 5 lines after any "Patient Name…" heading
+    if not first and not last:
+        _SKIP_LINE = re.compile(
+            r"(?:date|birth|prescriber|address|phone|fax|npi|diagnosis|"
+            r"authorization|page|server|insurance|provider|sex|gender|age)",
+            re.IGNORECASE,
+        )
+        for i, line in enumerate(lines):
+            if re.search(r"patient[\s_]*name", line, re.IGNORECASE):
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    if _SKIP_LINE.search(lines[j]) or not lines[j]:
+                        continue
+                    name_m = re.search(
+                        r"([A-Za-z][A-Za-z\-'\.]+)\s+([A-Za-z][A-Za-z\-'\.]+)",
+                        lines[j],
+                    )
+                    if name_m:
+                        first, last = name_m.group(1), name_m.group(2)
+                        break
+                if first:
+                    break
+
+    # D) Explicit separate fields
     if not first:
-        m = re.search(r"(?:first[\s_]*name|given[\s_]*name)\s*[:\-]?\s*([A-Za-z\-']+)", text, re.IGNORECASE)
+        m = re.search(
+            r"(?:first[\s_]*name|given[\s_]*name|fname)\s*[:\-]?\s*([A-Za-z][A-Za-z\-'\.]+)",
+            flat, re.IGNORECASE,
+        )
         if m:
             first = m.group(1).strip()
 
     if not last:
-        m = re.search(r"(?:last[\s_]*name|surname|family[\s_]*name)\s*[:\-]?\s*([A-Za-z\-']+)", text, re.IGNORECASE)
+        m = re.search(
+            r"(?:last[\s_]*name|surname|family[\s_]*name|lname)\s*[:\-]?\s*([A-Za-z][A-Za-z\-'\.]+)",
+            flat, re.IGNORECASE,
+        )
         if m:
             last = m.group(1).strip()
 
-    for pat in [
-        r"(?:DOB|Date[\s_]*of[\s_]*Birth|Birth[\s_]*Date|Born)\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",
-        r"(?:DOB|Date[\s_]*of[\s_]*Birth|Birth[\s_]*Date|Born)\s*[:\-]?\s*(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4})",
-        r"(?:DOB|Date[\s_]*of[\s_]*Birth|Birth[\s_]*Date|Born)\s*[:\-]?\s*([A-Za-z]+\s+\d{1,2},?\s+\d{4})",
-    ]:
-        m = re.search(pat, text, re.IGNORECASE)
+    # ── DOB extraction ───────────────────────────────────────────────────────
+
+    dob_patterns = [
+        # ISO  2024-01-15
+        r"(?:DOB|Date[\s_]*of[\s_]*Birth|Birth[\s_]*Date|Born|Birthdate)\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",
+        # US   01/15/2024  or  01-15-2024
+        r"(?:DOB|Date[\s_]*of[\s_]*Birth|Birth[\s_]*Date|Born|Birthdate)\s*[:\-]?\s*(\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4})",
+        # Verbose  January 15, 2024
+        r"(?:DOB|Date[\s_]*of[\s_]*Birth|Birth[\s_]*Date|Born|Birthdate)\s*[:\-]?\s*([A-Za-z]+\.?\s+\d{1,2},?\s+\d{4})",
+        # ISO without label — as last resort
+        r"\b(\d{4}-\d{2}-\d{2})\b",
+        # US without label — only when we already have a name to reduce false positives
+        r"\b(\d{1,2}/\d{1,2}/\d{4})\b",
+    ]
+    for pat in dob_patterns:
+        m = re.search(pat, flat, re.IGNORECASE)
         if m:
             dob_str = m.group(1).strip()
             break
 
-    confidence = 0.3
+    # ── Confidence score ─────────────────────────────────────────────────────
+    confidence = 0.2
     if first and last:
-        confidence += 0.4
+        confidence += 0.5
     elif first or last:
-        confidence += 0.2
+        confidence += 0.25
     if dob_str:
         confidence += 0.3
 
@@ -232,14 +350,14 @@ def _parse_dob(dob_str: str) -> date:
         return date.today()
     for fmt in (
         "%Y-%m-%d", "%m/%d/%Y", "%m-%d-%Y", "%d/%m/%Y",
-        "%B %d, %Y", "%b %d, %Y", "%m/%d/%y",
+        "%B %d, %Y", "%b %d, %Y", "%m/%d/%y", "%b. %d, %Y",
     ):
         try:
             return datetime.strptime(dob_str.strip(), fmt).date()
         except ValueError:
             continue
     try:
-        from dateutil import parser as dp
+        from dateutil import parser as dp  # type: ignore
         return dp.parse(dob_str, dayfirst=False).date()
     except Exception:
         return date.today()
@@ -262,9 +380,9 @@ async def upload_document(
 
     An Order record is automatically created from the extracted data.
 
-    When OPENAI_API_KEY is set, GPT-4o-mini Vision is used for scanned documents.
-    Text-layer PDFs also benefit from GPT-4o-mini for accurate parsing.
-    Without an API key, regex fallback handles text-layer PDFs only.
+    **No API key required** — OCR is performed locally using rapidocr-onnxruntime
+    (ONNX models, no internet access needed at runtime).
+    Set OPENAI_API_KEY for higher-accuracy extraction via GPT-4o-mini Vision.
     """
     settings = get_settings()
 
@@ -275,64 +393,90 @@ async def upload_document(
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="File exceeds 10 MB limit")
 
-    # ── Step 1: Try text-layer extraction ────────────────────────────────────
+    # ── Step 1: Native text layer (pdfplumber) ───────────────────────────────
     pdf_text = ""
     try:
-        import pdfplumber
-
+        import pdfplumber  # type: ignore
         with pdfplumber.open(io.BytesIO(content)) as pdf:
             pdf_text = "\n".join(p.extract_text() or "" for p in pdf.pages).strip()
     except Exception as exc:
         logger.warning("pdfplumber failed: %s", exc)
 
     has_text_layer = bool(pdf_text)
+    extraction_method = "unknown"
     patient_info: Optional[ExtractedPatientInfo] = None
 
     if has_text_layer:
-        logger.info("PDF has text layer (%d chars). Using text extraction.", len(pdf_text))
+        logger.info("PDF has native text layer (%d chars)", len(pdf_text))
         if settings.OPENAI_API_KEY:
             try:
                 patient_info = await _extract_with_openai_text(pdf_text, settings.OPENAI_API_KEY)
+                extraction_method = "openai-text"
             except Exception as exc:
-                logger.warning("OpenAI text extraction failed, trying regex: %s", exc)
+                logger.warning("OpenAI text extraction failed, falling back to regex: %s", exc)
                 patient_info = _extract_with_regex(pdf_text)
+                extraction_method = "regex-text"
         else:
             patient_info = _extract_with_regex(pdf_text)
+            extraction_method = "regex-text"
 
-    # ── Step 2: Scanned / image-only PDF → Vision API ────────────────────────
-    if not has_text_layer or (patient_info and not patient_info.first_name and not patient_info.last_name):
-        logger.info("No usable text layer. Rendering pages for Vision extraction.")
+    # ── Step 2: Scanned / image PDF → local OCR (no API key required) ────────
+    needs_ocr = not has_text_layer or (
+        patient_info and not patient_info.first_name and not patient_info.last_name
+    )
 
-        if not settings.OPENAI_API_KEY:
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "This PDF has no text layer (it is a scanned image or fax). "
-                    "Set the OPENAI_API_KEY environment variable to enable Vision-based extraction."
-                ),
+    if needs_ocr:
+        logger.info("Attempting local OCR (RapidOCR / ONNX) on rendered pages")
+        ocr_text = _ocr_pdf_to_text(content)
+
+        if ocr_text.strip():
+            patient_info = _extract_with_regex(ocr_text)
+            extraction_method = "ocr-regex"
+            logger.info(
+                "OCR extracted text (%d chars), regex confidence=%.2f",
+                len(ocr_text), patient_info.confidence,
             )
 
-        try:
-            pages_b64 = _render_pdf_pages(content, max_pages=MAX_VISION_PAGES)
-        except RuntimeError as exc:
-            raise HTTPException(status_code=422, detail=str(exc))
-        except Exception as exc:
-            logger.error("PDF rendering failed: %s", exc)
-            raise HTTPException(status_code=422, detail=f"Could not render PDF pages: {exc}")
+            # ── Step 3: Optionally refine with OpenAI Vision (higher accuracy) ──
+            if settings.OPENAI_API_KEY and patient_info.confidence < 0.7:
+                logger.info("Confidence low (%.2f), trying OpenAI Vision", patient_info.confidence)
+                try:
+                    pages_b64 = _render_pages_b64(content)
+                    if pages_b64:
+                        patient_info = await _extract_with_vision(pages_b64, settings.OPENAI_API_KEY)
+                        extraction_method = "openai-vision"
+                except Exception as exc:
+                    logger.warning("OpenAI Vision failed, keeping OCR result: %s", exc)
+        else:
+            # OCR produced nothing (engine unavailable or totally blank page)
+            if settings.OPENAI_API_KEY:
+                logger.info("OCR produced no text, falling back to OpenAI Vision")
+                try:
+                    pages_b64 = _render_pages_b64(content)
+                    if not pages_b64:
+                        raise HTTPException(status_code=422, detail="PDF produced no renderable pages")
+                    patient_info = await _extract_with_vision(pages_b64, settings.OPENAI_API_KEY)
+                    extraction_method = "openai-vision"
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    logger.error("Vision extraction failed: %s", exc)
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"OCR and Vision extraction both failed: {exc}",
+                    )
+            else:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "This PDF has no text layer and local OCR (rapidocr-onnxruntime) "
+                        "is not installed or produced no output. "
+                        "Run: pip install rapidocr-onnxruntime numpy  "
+                        "or set OPENAI_API_KEY to enable Vision-based extraction."
+                    ),
+                )
 
-        if not pages_b64:
-            raise HTTPException(status_code=422, detail="PDF produced no renderable pages")
-
-        try:
-            patient_info = await _extract_with_vision(pages_b64, settings.OPENAI_API_KEY)
-        except Exception as exc:
-            logger.error("Vision extraction failed: %s", exc)
-            raise HTTPException(
-                status_code=422,
-                detail=f"Vision-based extraction failed: {exc}",
-            )
-
-    # ── Validate extraction result ────────────────────────────────────────────
+    # ── Validate final result ─────────────────────────────────────────────────
     if not patient_info or (not patient_info.first_name and not patient_info.last_name):
         raise HTTPException(
             status_code=422,
@@ -357,17 +501,17 @@ async def upload_document(
     await db.refresh(order)
 
     logger.info(
-        "Extracted: %s %s DOB=%s (confidence=%.2f) from %s [%s]",
+        "Extracted: %s %s DOB=%s (confidence=%.2f, method=%s) from '%s'",
         patient_info.first_name,
         patient_info.last_name,
         patient_info.date_of_birth,
         patient_info.confidence,
+        extraction_method,
         file.filename,
-        "vision" if not has_text_layer else "text",
     )
 
     return UploadResponse(
         extracted_info=patient_info,
         order=OrderResponse.model_validate(order),
-        message="Document processed and order created successfully",
+        message=f"Document processed via {extraction_method} and order created successfully",
     )
