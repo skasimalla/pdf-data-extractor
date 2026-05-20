@@ -1,0 +1,3 @@
+[tool.vercel]
+# Explicit FastAPI entrypoint so Vercel's Python runtime can locate the app
+entrypoint = "api/index.py"

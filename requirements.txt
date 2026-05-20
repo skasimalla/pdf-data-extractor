@@ -1,0 +1,28 @@
+# Core API framework
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# Database
+sqlalchemy[asyncio]>=2.0.0
+aiosqlite>=0.20.0
+asyncpg>=0.30.0
+
+# Settings
+pydantic-settings>=2.6.0
+
+# PDF parsing — text layer
+pdfplumber>=0.11.0
+
+# PDF rendering to images — used for scanned/fax PDFs with no text layer
+# Self-contained (no Poppler system dependency required)
+pypdfium2>=4.30.0
+
+# LLM extraction (optional — set OPENAI_API_KEY to enable)
+openai>=1.57.0
+
+# Date parsing utilities
+python-dateutil>=2.9.0
+
+# ASGI adapter (used when deploying behind AWS Lambda / Vercel legacy runtime)
+mangum>=0.19.0
