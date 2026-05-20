@@ -165,14 +165,14 @@ export function OrderTable({ onDataChange }: { onDataChange?: () => void }) {
               />
             </form>
             <Select
-              value={statusFilter}
-              onValueChange={(v) => { setStatusFilter(v as OrderStatus | ""); setPage(1); }}
+              value={statusFilter || "all"}
+              onValueChange={(v) => { setStatusFilter(v === "all" ? "" : v as OrderStatus); setPage(1); }}
             >
               <SelectTrigger className="w-40">
                 <SelectValue placeholder="All statuses" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="">All statuses</SelectItem>
+                <SelectItem value="all">All statuses</SelectItem>
                 <SelectItem value="pending">Pending</SelectItem>
                 <SelectItem value="processing">Processing</SelectItem>
                 <SelectItem value="completed">Completed</SelectItem>
