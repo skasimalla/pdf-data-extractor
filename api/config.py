@@ -10,8 +10,9 @@ class Settings(BaseSettings):
         extra="ignore",  # ignore NEXT_PUBLIC_* and other frontend-only vars
     )
 
-    # Database — default to SQLite for local dev, set PostgreSQL URL for production
-    DATABASE_URL: str = "sqlite+aiosqlite:///./orders.db"
+    # /tmp is the only writable directory on Vercel serverless functions.
+    # For production set DATABASE_URL to a PostgreSQL connection string.
+    DATABASE_URL: str = "sqlite+aiosqlite:////tmp/orders.db"
 
     # OpenAI for PDF patient extraction
     OPENAI_API_KEY: str = ""

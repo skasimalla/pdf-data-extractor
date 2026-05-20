@@ -22,7 +22,14 @@ settings = get_settings()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await init_db()
+    try:
+        await init_db()
+    except Exception as exc:
+        # Log but don't crash — individual route handlers will surface DB errors
+        # if the connection is genuinely broken, rather than killing every cold start.
+        logging.getLogger("medorders.startup").error(
+            "DB initialisation failed on startup: %s", exc
+        )
     yield
 
 
