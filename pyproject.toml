@@ -1,3 +1,22 @@
+[project]
+name = "medorders"
+version = "1.0.0"
+description = "Medical Orders REST API — FastAPI + SQLAlchemy + PDF extraction"
+requires-python = ">=3.9"
+dependencies = [
+    "fastapi>=0.115.0",
+    "uvicorn[standard]>=0.32.0",
+    "python-multipart>=0.0.12",
+    "sqlalchemy[asyncio]>=2.0.0",
+    "aiosqlite>=0.20.0",
+    "asyncpg>=0.30.0",
+    "pydantic-settings>=2.6.0",
+    "pdfplumber>=0.11.0",
+    "pypdfium2>=4.30.0",
+    "openai>=1.57.0",
+    "python-dateutil>=2.9.0",
+    "mangum>=0.19.0",
+]
+
 [tool.vercel]
-# Explicit FastAPI entrypoint so Vercel's Python runtime can locate the app
 entrypoint = "api/index.py"
