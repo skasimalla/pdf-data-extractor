@@ -10,20 +10,20 @@
     "api:dev": "uvicorn api.index:app --reload --port 8000"
   },
   "dependencies": {
-    "next": "15.3.2",
+    "next": "15.5.18",
     "react": "^19.0.0",
     "react-dom": "^19.0.0",
-    "swr": "^2.3.3",
-    "lucide-react": "^0.511.0",
+    "swr": "^2.2.0",
+    "lucide-react": "^0.400.0",
     "clsx": "^2.1.1",
-    "tailwind-merge": "^3.3.0",
-    "date-fns": "^4.1.0",
-    "react-hook-form": "^7.56.4",
-    "@hookform/resolvers": "^5.0.1",
-    "zod": "^3.24.4",
-    "sonner": "^2.3.3",
-    "@radix-ui/react-dialog": "^1.1.14",
-    "@radix-ui/react-select": "^2.2.5"
+    "tailwind-merge": "^2.3.0",
+    "date-fns": "^3.6.0",
+    "react-hook-form": "^7.52.0",
+    "@hookform/resolvers": "^3.3.0",
+    "zod": "^3.23.0",
+    "sonner": "^1.4.0",
+    "@radix-ui/react-dialog": "^1.1.0",
+    "@radix-ui/react-select": "^2.1.0"
   },
   "devDependencies": {
     "typescript": "^5",
@@ -31,9 +31,9 @@
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "eslint": "^9",
-    "eslint-config-next": "15.3.2",
+    "eslint-config-next": "15.5.18",
     "tailwindcss": "^4",
     "@tailwindcss/postcss": "^4",
-    "postcss": "^8"
+    "postcss": "^8.5.10"
   }
 }
