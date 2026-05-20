@@ -42,20 +42,73 @@ MAX_PAGES = 2
 
 _ocr_engine: Optional[Any] = None
 _ocr_available: Optional[bool] = None
+_ocr_init_error: str = ""
 
 
 def _get_ocr_engine() -> Optional[Any]:
-    """Lazily initialise a RapidOCR engine (loads ONNX models once per process)."""
-    global _ocr_engine, _ocr_available
-    if _ocr_available is None:
-        try:
-            from rapidocr_onnxruntime import RapidOCR  # type: ignore
-            _ocr_engine = RapidOCR()
-            _ocr_available = True
-            logger.info("RapidOCR (ONNX) engine ready")
-        except Exception as exc:
-            logger.warning("RapidOCR not available — OCR disabled: %s", exc)
-            _ocr_available = False
+    """
+    Lazily initialise a RapidOCR ONNX engine (models loaded once per process).
+
+    rapidocr-onnxruntime >= 1.4.0 bundles the ONNX model files inside the
+    Python wheel (site-packages/rapidocr_onnxruntime/models/*.onnx).
+    We resolve those paths explicitly so the engine works even when Vercel's
+    working directory differs from the package install directory.
+    """
+    global _ocr_engine, _ocr_available, _ocr_init_error
+    if _ocr_available is not None:
+        return _ocr_engine if _ocr_available else None
+
+    try:
+        import os
+        import rapidocr_onnxruntime as _rapi_pkg  # type: ignore
+        from rapidocr_onnxruntime import RapidOCR  # type: ignore
+
+        models_dir = os.path.join(os.path.dirname(_rapi_pkg.__file__), "models")
+
+        # Resolve bundled model paths (>= 1.4.0 ships them in the wheel)
+        def _find(prefix: str) -> Optional[str]:
+            if not os.path.isdir(models_dir):
+                return None
+            for name in os.listdir(models_dir):
+                if name.endswith(".onnx") and prefix in name.lower():
+                    return os.path.join(models_dir, name)
+            return None
+
+        det = _find("det")
+        cls = _find("cls")
+        rec = _find("rec")
+
+        kwargs: dict = {}
+        if det:
+            kwargs["det_model_path"] = det
+        if cls:
+            kwargs["cls_model_path"] = cls
+        if rec:
+            kwargs["rec_model_path"] = rec
+
+        logger.info(
+            "RapidOCR model paths — det=%s cls=%s rec=%s",
+            det, cls, rec,
+        )
+
+        # Limit onnxruntime to single-threaded CPU to avoid libgomp/OpenMP
+        # issues in Lambda / Vercel serverless containers.
+        os.environ.setdefault("OMP_NUM_THREADS", "1")
+        os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+        _ocr_engine = RapidOCR(**kwargs)
+        _ocr_available = True
+        logger.info("RapidOCR (ONNX) engine ready")
+
+    except Exception as exc:
+        import traceback
+        _ocr_init_error = f"{type(exc).__name__}: {exc}"
+        logger.error(
+            "RapidOCR init failed — OCR disabled.\n%s",
+            traceback.format_exc(),
+        )
+        _ocr_available = False
+
     return _ocr_engine if _ocr_available else None
 
 
@@ -91,22 +144,25 @@ def _render_pages_b64(pdf_bytes: bytes, max_pages: int = MAX_PAGES) -> List[str]
 # ─── OCR extraction ───────────────────────────────────────────────────────────
 
 
+def _tesseract_ocr_page(img: Any) -> str:
+    """Run pytesseract on a single PIL Image. Returns '' if tesseract is not installed."""
+    try:
+        import pytesseract  # type: ignore
+        return pytesseract.image_to_string(img, lang="eng")
+    except Exception:
+        return ""
+
+
 def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
     """
-    Render a scanned PDF and run RapidOCR (ONNX) on each page.
-    Returns the concatenated raw text, or '' if OCR is unavailable.
-    No API key or system binary required.
+    Render a scanned PDF and extract text via OCR.
+
+    Strategy (in order):
+      1. RapidOCR (ONNX) — bundled models, no system binary, works everywhere.
+      2. pytesseract — fallback for local development (requires brew/apt tesseract).
+
+    Returns the concatenated raw text, or '' if both engines are unavailable.
     """
-    ocr = _get_ocr_engine()
-    if not ocr:
-        return ""
-
-    try:
-        import numpy as np  # type: ignore
-    except ImportError:
-        logger.warning("numpy not available — OCR disabled")
-        return ""
-
     try:
         page_images = _render_pages_pil(pdf_bytes)
     except RuntimeError as exc:
@@ -115,20 +171,49 @@ def _ocr_pdf_to_text(pdf_bytes: bytes) -> str:
         logger.error("PDF rendering failed: %s", exc)
         return ""
 
-    texts: List[str] = []
-    for img in page_images:
-        try:
-            arr = np.array(img)
-            result, _ = ocr(arr)
-            if result:
-                page_text = "\n".join(item[1] for item in result if item[1])
-                texts.append(page_text)
-        except Exception as exc:
-            logger.warning("OCR failed on page: %s", exc)
+    if not page_images:
+        return ""
 
-    combined = "\n\n".join(texts)
-    logger.info("OCR produced %d characters from %d page(s)", len(combined), len(page_images))
-    return combined
+    # ── Strategy 1: RapidOCR ─────────────────────────────────────────────────
+    ocr = _get_ocr_engine()
+    if ocr:
+        try:
+            import numpy as np  # type: ignore
+            texts: List[str] = []
+            for img in page_images:
+                result, _ = ocr(np.array(img))
+                if result:
+                    texts.append("\n".join(item[1] for item in result if item[1]))
+            combined = "\n\n".join(texts)
+            logger.info(
+                "RapidOCR produced %d chars from %d page(s)",
+                len(combined), len(page_images),
+            )
+            if combined.strip():
+                return combined
+        except Exception as exc:
+            logger.warning("RapidOCR inference failed: %s", exc)
+
+    # ── Strategy 2: pytesseract (local fallback) ─────────────────────────────
+    tess_texts: List[str] = []
+    for img in page_images:
+        t = _tesseract_ocr_page(img)
+        if t.strip():
+            tess_texts.append(t)
+
+    if tess_texts:
+        combined = "\n\n".join(tess_texts)
+        logger.info(
+            "pytesseract produced %d chars from %d page(s)",
+            len(combined), len(page_images),
+        )
+        return combined
+
+    logger.warning(
+        "Both OCR strategies produced no text. "
+        "RapidOCR init error: %s", _ocr_init_error or "none",
+    )
+    return ""
 
 
 # ─── OpenAI Vision extraction (scanned / image-only PDFs) ────────────────────
@@ -466,12 +551,13 @@ async def upload_document(
                         detail=f"OCR and Vision extraction both failed: {exc}",
                     )
             else:
+                diag = f" Init error: {_ocr_init_error}" if _ocr_init_error else ""
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        "This PDF has no text layer and local OCR (rapidocr-onnxruntime) "
-                        "is not installed or produced no output. "
-                        "Run: pip install rapidocr-onnxruntime numpy  "
+                        "This PDF has no text layer and local OCR produced no output."
+                        f"{diag} "
+                        "Ensure rapidocr-onnxruntime>=1.4.0 and numpy are installed, "
                         "or set OPENAI_API_KEY to enable Vision-based extraction."
                     ),
                 )

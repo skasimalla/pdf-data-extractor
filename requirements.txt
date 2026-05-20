@@ -19,9 +19,11 @@ pdfplumber>=0.11.0
 pypdfium2>=4.30.0
 
 # OCR for scanned / image-only PDFs (no system binary required, ONNX-based)
-# Models are bundled in the wheel — no runtime downloads needed.
-rapidocr-onnxruntime>=1.3.22
+# >= 1.4.0 bundles ONNX model files in the wheel — no runtime downloads needed.
+rapidocr-onnxruntime>=1.4.0
 numpy>=1.24.0
+# pytesseract is an optional local-dev fallback (requires: brew install tesseract)
+pytesseract>=0.3.10
 
 # LLM extraction (optional — set OPENAI_API_KEY to enable for higher accuracy)
 openai>=1.57.0
